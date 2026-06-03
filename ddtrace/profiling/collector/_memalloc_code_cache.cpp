@@ -59,15 +59,15 @@ CodeFunctionCache::occupancy_histogram() const
     return hist;
 }
 
-std::optional<Datadog::function_id>
-CodeFunctionCache::lookup(PyCodeObject* code)
+std::optional<CacheHit>
+CodeFunctionCache::lookup(PyCodeObject* code, int lasti)
 {
     Set& s = sets_[set_index(code)];
     for (size_t i = 0; i < WAYS_PER_SET; ++i) {
         if (s.codes[i] == code) {
             s.recently_used_mask = set_way_used(s.recently_used_mask, i);
             ++hits_;
-            return s.functions[i];
+            return CacheHit{ s.functions[i], s.lines[i], s.lastis[i] == lasti };
         }
     }
     ++misses_;
@@ -75,7 +75,7 @@ CodeFunctionCache::lookup(PyCodeObject* code)
 }
 
 void
-CodeFunctionCache::insert(PyCodeObject* code, Datadog::function_id id)
+CodeFunctionCache::insert(PyCodeObject* code, Datadog::function_id id, int lasti, int line)
 {
     Set& s = sets_[set_index(code)];
 
@@ -84,21 +84,21 @@ CodeFunctionCache::insert(PyCodeObject* code, Datadog::function_id id)
         if (s.codes[i] == nullptr) {
             s.codes[i] = code;
             s.functions[i] = id;
+            s.lastis[i] = lasti;
+            s.lines[i] = line;
             s.recently_used_mask = set_way_used(s.recently_used_mask, i);
             return;
         }
         if (s.codes[i] == code) {
             s.functions[i] = id;
+            s.lastis[i] = lasti;
+            s.lines[i] = line;
             s.recently_used_mask = set_way_used(s.recently_used_mask, i);
             return;
         }
     }
 
-    /* Pass 2: CLOCK / Second-Chance. Sweep ways starting from clock_hand;
-     * a way with recently_used=0 is evicted. Ways with recently_used=1 get
-     * cleared and the hand advances. Termination is guaranteed within
-     * 2 * WAYS_PER_SET iterations because each visited way that survives
-     * the first pass has its bit cleared. */
+    /* Pass 2: CLOCK / Second-Chance. */
     for (size_t step = 0; step < 2 * WAYS_PER_SET; ++step) {
         size_t way = s.clock_hand;
         s.clock_hand = static_cast<uint8_t>((s.clock_hand + 1) % WAYS_PER_SET);
@@ -106,11 +106,27 @@ CodeFunctionCache::insert(PyCodeObject* code, Datadog::function_id id)
             ++evictions_;
             s.codes[way] = code;
             s.functions[way] = id;
+            s.lastis[way] = lasti;
+            s.lines[way] = line;
             s.recently_used_mask = set_way_used(s.recently_used_mask, way);
             return;
         }
         s.recently_used_mask = clear_way_used(s.recently_used_mask, way);
     }
+}
+
+void
+CodeFunctionCache::update_line(PyCodeObject* code, int lasti, int line)
+{
+    Set& s = sets_[set_index(code)];
+    for (size_t i = 0; i < WAYS_PER_SET; ++i) {
+        if (s.codes[i] == code) {
+            s.lastis[i] = lasti;
+            s.lines[i] = line;
+            return;
+        }
+    }
+    /* Code was evicted between lookup and update_line — safe to ignore. */
 }
 
 void
