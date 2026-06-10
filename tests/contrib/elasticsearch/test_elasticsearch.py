@@ -1,3 +1,4 @@
+import asyncio
 import datetime
 from http.client import HTTPConnection
 from importlib import import_module
@@ -373,3 +374,73 @@ class ElasticsearchPatchTest(TracerTestCase):
         assert len(versions) > 0
         for module_name, v in versions.items():
             emit_integration_and_version_to_test_agent("elasticsearch", v, module_name=module_name)
+
+    def test_span_closed_immediately_on_transport_error(self):
+        """Regression test for gh #17100: sync path span must not become a zombie on TransportError.
+
+        The check runs inside the except block while the exception (and its traceback)
+        is still alive. That keeps the generator frame on the call stack, so without
+        the coro.close() fix the span would still be open here.
+
+        For pre-elastic-transport clients (elasticsearch<8, opensearch-py), TransportError
+        propagates inside the generator which sets span.error=1 via the except clause.
+        For elastic-transport (elasticsearch8), the transport layer returns the response and
+        the higher-level client raises; span.error may be 0 but span.finished must be True.
+        """
+        try:
+            self.es.search(index="nonexistent_index_for_zombie_span_test", body={"query": {"match_all": {}}})
+        except Exception:
+            spans = self.get_spans()
+            self.reset()
+            assert len(spans) == 1, f"Expected 1 span, got {len(spans)}"
+            span = spans[0]
+            assert span.finished, "span must be finished immediately — generator not closed (gh #17100)"
+            assert span.name == "elasticsearch.query"
+            assert span.span_type == "elasticsearch"
+            assert span.get_tag("component") == "elasticsearch"
+            assert span.get_tag("span.kind") == "client"
+            assert span.get_tag("elasticsearch.method") in ("GET", "POST")
+            assert span.get_tag("http.status_code") is not None
+
+    def test_async_span_closed_immediately_on_transport_error(self):
+        """Regression test for gh #17100: async path span must not become a zombie on TransportError.
+
+        The async path uses ``await next(coro)`` — if the awaited call raises, the generator
+        is left suspended inside the ``with tracer.trace(...)`` block. Without ``coro.close()``
+        the span stays open until GC.
+
+        This test uses opensearch-py's AsyncOpenSearch whose async transport raises
+        TransportError directly (not via a higher-level wrapper), exercising the exact
+        zombie-span scenario: exception escapes ``await next(coro)`` while the generator
+        is still at its yield point. The check runs inside the except block while the
+        exception traceback is live, preventing GC from closing the generator prematurely.
+        """
+        opensearchpy = pytest.importorskip("opensearchpy", reason="opensearch-py not installed in this env")
+        if not hasattr(opensearchpy, "AsyncOpenSearch"):
+            pytest.skip("opensearch-py < 2.0: AsyncOpenSearch not available")
+        async_client_cls = opensearchpy.AsyncOpenSearch
+        config = self._get_es_config()
+        url = "http://%s:%d" % (config["host"], config["port"])
+
+        async def run():
+            es = async_client_cls(hosts=[url])
+            try:
+                await es.search(index="nonexistent_index_for_zombie_span_test", body={"query": {"match_all": {}}})
+            except Exception:
+                spans = self.get_spans()
+                self.reset()
+                assert len(spans) == 1, f"Expected 1 span, got {len(spans)}"
+                span = spans[0]
+                assert span.finished, (
+                    "span must be finished immediately — async generator not closed (gh #17100). "
+                    "Without coro.close() the generator stays at its yield point until GC."
+                )
+                assert span.name == "elasticsearch.query"
+                assert span.span_type == "elasticsearch"
+                assert span.get_tag("component") == "elasticsearch"
+                assert span.get_tag("span.kind") == "client"
+                assert span.get_tag("elasticsearch.method") in ("GET", "POST")
+            finally:
+                await es.close()
+
+        asyncio.get_event_loop().run_until_complete(run())
